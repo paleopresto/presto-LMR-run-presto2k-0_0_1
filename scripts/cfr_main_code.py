@@ -108,6 +108,47 @@ if os.path.exists(_pdb_path):
 
 job_cfg.prep_da_cfg('/tmp/merged_config.yml', verbose=True)
 
+# ── Phase 1.4: seasons from interpretation metadata (sens-metadata-seasons) ──
+# metadata_season_dict ({TSid: {tas: months, pr: months}}, from
+# scripts/metadata_seasons.py) gives a record's season from its own
+# interpretations. Such a record is recalibrated on that one season instead of
+# the best of its class pool; a Bilinear (tas, pr) record missing one of the
+# two uses the other's. Records not in the dict keep the class-based season.
+# A record whose metadata season cannot be calibrated is dropped.
+META_SEASONS = {str(k): v for k, v in (base_config.get('metadata_season_dict') or {}).items()}
+_meta_applied = set()
+if META_SEASONS:
+    _meta_rows = []
+    _cp = job_cfg.configs.get('psm_calib_period', [1850, 2015])
+    _nlb = job_cfg.configs.get('nobs_lb', 25)
+    for pid, pobj in job_cfg.proxydb.records.items():
+        ms = META_SEASONS.get(str(pid))
+        if not ms or 'calibrated' not in pobj.tags:
+            continue
+        before = pobj.psm.calib_details['seasonality']
+        if type(pobj.psm).__name__ == 'Bilinear':
+            s1, s2 = ms.get('tas') or ms.get('pr'), ms.get('pr') or ms.get('tas')
+            pobj.psm.calibrate(calib_period=_cp, nobs_lb=_nlb, season_list1=[s1], season_list2=[s2])
+        else:
+            if not ms.get('tas'):
+                continue
+            pobj.psm.calibrate(calib_period=_cp, nobs_lb=_nlb, season_list=[ms['tas']])
+        if pobj.psm.model is None or not pobj.psm.calib_details:
+            pobj.tags.discard('calibrated')
+            _meta_rows.append(dict(pid=pid, ptype=pobj.ptype, before=str(before), after='', status='drop_uncalibrated'))
+            continue
+        pobj.R = pobj.psm.calib_details['PSMmse']
+        pobj.pseudo = pobj.psm.forward()
+        _meta_applied.add(str(pid))
+        _meta_rows.append(dict(pid=pid, ptype=pobj.ptype, before=str(before),
+                               after=str(pobj.psm.calib_details['seasonality']), status='metadata_season',
+                               fitR2adj=pobj.psm.calib_details['fitR2adj']))
+    _mt = pd.DataFrame(_meta_rows)
+    os.makedirs(base_config.get('save_dirpath', '/recons'), exist_ok=True)
+    _mt.to_csv(os.path.join(base_config.get('save_dirpath', '/recons'), 'metadata_seasons_applied.csv'), index=False)
+    print('Metadata seasons:', _mt.status.value_counts().to_dict() if len(_mt) else {},
+          f'({len(META_SEASONS)} records in metadata_season_dict)')
+
 # ── Phase 1.5: interpretation against PSM ────────────────────────────────────
 # Any record may enter, but a calibrated record is dropped when its metadata
 # contradicts the PSM it was calibrated with:
@@ -217,7 +258,11 @@ def screen_interpretations(job, df, clim_dict, out_csv):
                     expected[var] = exp.pop()
                 elif len(exp) > 1:
                     detail += f'{var}: conflicting directions, not checked;'
-            if expected and not _signs_ok(pobj.psm.model, expected):
+            if expected and not _signs_ok(pobj.psm.model, expected) and str(pid) in _meta_applied:
+                # the metadata season is the record's only season
+                status = 'drop_direction'
+                detail += 'metadata season gives the wrong sign;'
+            elif expected and not _signs_ok(pobj.psm.model, expected):
                 sn = _refit_signed(pobj, expected, season_dict.get(pobj.ptype, [list(range(1, 13))]), calib_period)
                 if sn is None:
                     status = 'drop_direction'
