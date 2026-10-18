@@ -75,6 +75,7 @@ PTYPE_MAP = {
     ('ice core',        'accumulation'):              'ice.accumulation',
     ('glacierice',      'd18o'):                      'ice.d18O',
     ('glacierice',      'dd'):                        'ice.dD',
+    ('glacierice',      'd2h'):                       'ice.dD',
     ('lake sediment',   'varve_thickness'):           'lake.varve_thickness',
     ('lake sediment',   'varve thickness'):           'lake.varve_thickness',
     ('lake sediment',   'varve_property'):            'lake.varve_property',
@@ -300,6 +301,30 @@ def _get_scalar(row, *keys, default=0.0):
     return default
 
 
+def annualize_fractional(time_arr, val_arr, max_dt=1.2):
+    """Calendar-year means for a record that is not on whole years.
+
+    cfr calibrates by matching each record's times to whole instrumental
+    years, so a sub-annual record on fractional times (Ant_033: 2 of 2281
+    samples in 1850-2015 on whole years) never reaches the 25 overlapping
+    points and is left uncalibrated. Averaging it into calendar years here
+    does what cfr's annualize_proxydb would, but only for those records:
+    cfr's annualize drops any record whose time axis starts at or before
+    year 0, so applying it to every class lost 15 long annual records
+    (sens-annualize-all, 2026-10-17). Records already on whole years, and
+    records coarser than the run's dt filter (median spacing above
+    max_dt, which cfr drops anyway), are returned unchanged.
+    """
+    if np.all(time_arr == np.floor(time_arr)) or len(time_arr) < 2:
+        return time_arr, val_arr, False
+    if np.median(np.diff(time_arr)) > max_dt:
+        return time_arr, val_arr, False
+    yrs = np.floor(time_arr)
+    uy, inv = np.unique(yrs, return_inverse=True)
+    means = np.bincount(inv, weights=val_arr) / np.bincount(inv)
+    return uy, means, True
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     if len(sys.argv) < 3:
@@ -426,6 +451,7 @@ def main():
     # ── Build DataFrame (cfr.ProxyDatabase.fetch expects pd.read_pickle → from_df) ──
     df_rows = []
     n_ok    = 0
+    n_annualized = 0
     n_skip  = 0
 
     SKIP_MISSING_VALUES  = 'missing proxy values'
@@ -507,6 +533,8 @@ def main():
         time_arr, val_arr = time_arr[mask], val_arr[mask]
         idx = np.argsort(time_arr)
         time_arr, val_arr = time_arr[idx], val_arr[idx]
+        time_arr, val_arr, was_ann = annualize_fractional(time_arr, val_arr)
+        n_annualized += was_ann
 
         # Skip constant-value records: OLS slope=0 → varye=0, MSE=0 → ob_err=0
         # → kdenom=0 → EnKF Kalman gain blows up
@@ -577,6 +605,7 @@ def main():
         n_ok += 1
 
     print(f"\nProxy records: {n_ok} added, {n_skip} skipped (of {len(proxy_rows)} candidates)")
+    print(f"Annualized {n_annualized} records not on whole years")
 
     # ── Skip reason breakdown ────────────────────────────────────────────────
     if skip_records:
